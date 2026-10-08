@@ -83,6 +83,8 @@ public class CourseOfferingService {
         Faculty faculty   = resolveOptionalFaculty(dto.getAssignedFacultyId());
         Room preferredRoom = resolveOptionalRoom(dto.getPreferredRoomId());
 
+        validateFacultyWorkload(faculty, dto.getWeeklyPeriods(), null);
+
         if (courseOfferingRepository.existsBySectionIdAndSubjectId(section.getId(), subject.getId())) {
             throw new ValidationException(
                     "A course offering for section '" + section.getCode() +
@@ -106,6 +108,8 @@ public class CourseOfferingService {
         Subject subject         = subjectService.findEntityById(dto.getSubjectId());
         Faculty faculty         = resolveOptionalFaculty(dto.getAssignedFacultyId());
         Room preferredRoom      = resolveOptionalRoom(dto.getPreferredRoomId());
+
+        validateFacultyWorkload(faculty, dto.getWeeklyPeriods(), offering.getId());
 
         // Uniqueness check: reject only if the duplicate belongs to a *different* offering
         courseOfferingRepository.findBySectionIdAndSubjectId(section.getId(), subject.getId())
@@ -144,6 +148,23 @@ public class CourseOfferingService {
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    private void validateFacultyWorkload(Faculty faculty, int newWeeklyPeriods, Long currentOfferingId) {
+        if (faculty == null) {
+            return;
+        }
+        int existingWorkload = courseOfferingRepository.findByAssignedFacultyId(faculty.getId()).stream()
+                .filter(co -> currentOfferingId == null || !co.getId().equals(currentOfferingId))
+                .mapToInt(CourseOffering::getWeeklyPeriods)
+                .sum();
+
+        int totalWorkload = existingWorkload + newWeeklyPeriods;
+        if (totalWorkload > faculty.getMaxWeeklyHours()) {
+            throw new ValidationException(
+                    "Faculty '" + faculty.getName() + "' weekly workload (" + totalWorkload +
+                    ") exceeds maximum allowed hours (" + faculty.getMaxWeeklyHours() + ").");
+        }
+    }
 
     private void validatePeriods(int weeklyPeriods, int durationPeriods) {
         if (weeklyPeriods <= 0) {

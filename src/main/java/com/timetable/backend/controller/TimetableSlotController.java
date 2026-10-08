@@ -40,7 +40,7 @@ public class TimetableSlotController {
         } else if (roomId != null) {
             return ResponseEntity.ok(timetableSlotService.getSlotsByRoom(roomId));
         }
-        return ResponseEntity.ok(Collections.emptyList());
+        return ResponseEntity.ok(timetableSlotService.getAllSlots());
     }
 
     @GetMapping("/api/timetable-slots/section/{sectionId}")

@@ -60,6 +60,13 @@ public class TimetableSlotService {
     // -------------------------------------------------------------------------
 
     @Transactional(readOnly = true)
+    public List<TimetableSlotResponseDTO> getAllSlots() {
+        return slotRepository.findAll().stream()
+                .map(this::mapToDTO)
+                .collect(Collectors.toList());
+    }
+
+    @Transactional(readOnly = true)
     public List<TimetableSlotResponseDTO> getSlotsBySection(Long sectionId) {
         sectionService.findEntityById(sectionId); // validate exists
         return slotRepository.findBySectionIdOrderByDayAscPeriodIndexAsc(sectionId)
