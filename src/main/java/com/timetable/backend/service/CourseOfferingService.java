@@ -83,6 +83,13 @@ public class CourseOfferingService {
         Faculty faculty   = resolveOptionalFaculty(dto.getAssignedFacultyId());
         Room preferredRoom = resolveOptionalRoom(dto.getPreferredRoomId());
 
+        if (preferredRoom != null) {
+            String incompatibility = RoomCompatibilityValidator.getIncompatibilityReason(preferredRoom, subject);
+            if (incompatibility != null) {
+                throw new ValidationException(incompatibility);
+            }
+        }
+
         validateFacultyWorkload(faculty, dto.getWeeklyPeriods(), null);
 
         if (courseOfferingRepository.existsBySectionIdAndSubjectId(section.getId(), subject.getId())) {
@@ -108,6 +115,13 @@ public class CourseOfferingService {
         Subject subject         = subjectService.findEntityById(dto.getSubjectId());
         Faculty faculty         = resolveOptionalFaculty(dto.getAssignedFacultyId());
         Room preferredRoom      = resolveOptionalRoom(dto.getPreferredRoomId());
+
+        if (preferredRoom != null) {
+            String incompatibility = RoomCompatibilityValidator.getIncompatibilityReason(preferredRoom, subject);
+            if (incompatibility != null) {
+                throw new ValidationException(incompatibility);
+            }
+        }
 
         validateFacultyWorkload(faculty, dto.getWeeklyPeriods(), offering.getId());
 

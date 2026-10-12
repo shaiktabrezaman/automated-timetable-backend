@@ -43,6 +43,11 @@ public class TimetableSlotController {
         return ResponseEntity.ok(timetableSlotService.getAllSlots());
     }
 
+    @PostMapping("/api/timetable-slots/section/{sectionId}/fill-activities")
+    public ResponseEntity<List<TimetableSlotResponseDTO>> fillActivities(@PathVariable Long sectionId) {
+        return ResponseEntity.ok(timetableSlotService.fillActivities(sectionId));
+    }
+
     @GetMapping("/api/timetable-slots/section/{sectionId}")
     public ResponseEntity<List<TimetableSlotResponseDTO>> getSlotsBySection(@PathVariable Long sectionId) {
         return ResponseEntity.ok(timetableSlotService.getSlotsBySection(sectionId));

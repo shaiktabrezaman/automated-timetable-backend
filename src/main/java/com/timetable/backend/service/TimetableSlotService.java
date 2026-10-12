@@ -6,22 +6,24 @@ import com.timetable.backend.dto.response.TimetableSlotResponseDTO;
 import com.timetable.backend.exception.ResourceNotFoundException;
 import com.timetable.backend.exception.SchedulingConflictException;
 import com.timetable.backend.exception.ValidationException;
+import com.timetable.backend.model.Department;
 import com.timetable.backend.model.Faculty;
 import com.timetable.backend.model.Room;
 import com.timetable.backend.model.Section;
+import com.timetable.backend.model.Semester;
 import com.timetable.backend.model.Subject;
 import com.timetable.backend.model.TimetableSlot;
 import com.timetable.backend.model.enums.RoomType;
 import com.timetable.backend.model.enums.SubjectType;
 import com.timetable.backend.repository.FacultyRepository;
 import com.timetable.backend.repository.RoomRepository;
+import com.timetable.backend.repository.SubjectRepository;
 import com.timetable.backend.repository.TimetableSlotRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.DayOfWeek;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -34,25 +36,86 @@ public class TimetableSlotService {
     private static final int MAX_PERIOD = 7;
     private static final int MIN_PERIOD = 1;
 
+    public static class ActivitySpec {
+        private final String code;
+        private final String name;
+        private final String shortName;
+        private final int weeklyPeriods;
+
+        public ActivitySpec(String code, String name, String shortName, int weeklyPeriods) {
+            this.code = code;
+            this.name = name;
+            this.shortName = shortName;
+            this.weeklyPeriods = weeklyPeriods;
+        }
+
+        public String getCode() { return code; }
+        public String getName() { return name; }
+        public String getShortName() { return shortName; }
+        public int getWeeklyPeriods() { return weeklyPeriods; }
+    }
+
+    public static final List<ActivitySpec> INSTITUTIONAL_ACTIVITIES = List.of(
+            new ActivitySpec("ACT-LIB", "Library", "LIB", 3),
+            new ActivitySpec("ACT-NPT", "NPTEL Self-Study", "NPTEL", 3),
+            new ActivitySpec("ACT-SPT", "Sports & Games", "SPORTS", 2),
+            new ActivitySpec("ACT-CNS", "Counselling / Mentoring", "COUNS", 2),
+            new ActivitySpec("ACT-NSS", "NSS / NCC / Social Activity", "NSS/NCC", 2)
+    );
+
+    private static final List<String> ACTIVITY_SCHEDULE = List.of(
+            "ACT-LIB", "ACT-SPT",
+            "ACT-NPT", "ACT-CNS",
+            "ACT-LIB", "ACT-NSS",
+            "ACT-NPT", "ACT-SPT",
+            "ACT-LIB", "ACT-CNS",
+            "ACT-NPT", "ACT-NSS"
+    );
+
+    private static final List<DayOfWeek> WORKING_DAYS = List.of(
+            DayOfWeek.MONDAY,
+            DayOfWeek.TUESDAY,
+            DayOfWeek.WEDNESDAY,
+            DayOfWeek.THURSDAY,
+            DayOfWeek.FRIDAY,
+            DayOfWeek.SATURDAY
+    );
+
+    public static class DayPeriodCoordinate {
+        private final DayOfWeek day;
+        private final int periodIndex;
+
+        public DayPeriodCoordinate(DayOfWeek day, int periodIndex) {
+            this.day = day;
+            this.periodIndex = periodIndex;
+        }
+
+        public DayOfWeek getDay() { return day; }
+        public int getPeriodIndex() { return periodIndex; }
+    }
+
     private final TimetableSlotRepository slotRepository;
     private final SectionService sectionService;
     private final SubjectService subjectService;
     private final FacultyRepository facultyRepository;
     private final RoomRepository roomRepository;
     private final CourseOfferingService courseOfferingService;
+    private final SubjectRepository subjectRepository;
 
     public TimetableSlotService(TimetableSlotRepository slotRepository,
                                 SectionService sectionService,
                                 SubjectService subjectService,
                                 FacultyRepository facultyRepository,
                                 RoomRepository roomRepository,
-                                CourseOfferingService courseOfferingService) {
+                                CourseOfferingService courseOfferingService,
+                                SubjectRepository subjectRepository) {
         this.slotRepository       = slotRepository;
         this.sectionService       = sectionService;
         this.subjectService       = subjectService;
         this.facultyRepository    = facultyRepository;
         this.roomRepository       = roomRepository;
         this.courseOfferingService = courseOfferingService;
+        this.subjectRepository    = subjectRepository;
     }
 
     // -------------------------------------------------------------------------
@@ -186,6 +249,163 @@ public class TimetableSlotService {
         slotRepository.deleteBySectionId(sectionId);
     }
 
+    /**
+     * Fills all 12 empty periods for a section with 5 institutional activities:
+     * - ACT-LIB (Library): 3 weekly periods
+     * - ACT-NPT (NPTEL Self-Study): 3 weekly periods
+     * - ACT-SPT (Sports & Games): 2 weekly periods
+     * - ACT-CNS (Counselling / Mentoring): 2 weekly periods
+     * - ACT-NSS (NSS / NCC / Social Activity): 2 weekly periods
+     * Total: 12 periods.
+     * All activities have faculty = null, room = null, and spanPeriods = 1.
+     * Operation is transactional and idempotent.
+     */
+    @Transactional
+    public List<TimetableSlotResponseDTO> fillActivities(Long sectionId) {
+        Section section = sectionService.findEntityById(sectionId);
+        List<TimetableSlot> currentSlots = slotRepository.findBySectionIdOrderByDayAscPeriodIndexAsc(sectionId);
+
+        Set<String> institutionalCodes = INSTITUTIONAL_ACTIVITIES.stream()
+                .map(ActivitySpec::getCode)
+                .collect(Collectors.toSet());
+
+        // Check if section is already filled (idempotent check)
+        if (currentSlots.size() == 42) {
+            long activityCount = currentSlots.stream()
+                    .filter(s -> s.getSubject() != null && institutionalCodes.contains(s.getSubject().getCode()))
+                    .count();
+            if (activityCount == 12) {
+                // Already complete, return existing slots
+                return currentSlots.stream().map(this::mapToDTO).collect(Collectors.toList());
+            } else {
+                throw new ValidationException(
+                        "Section '" + section.getCode() + "' has 42 slots, but does not have the expected 12 activity slots."
+                );
+            }
+        }
+
+        // Map occupied coordinates
+        Set<String> occupiedCoords = new HashSet<>();
+        for (TimetableSlot slot : currentSlots) {
+            occupiedCoords.add(slot.getDay() + ":" + slot.getPeriodIndex());
+        }
+
+        // Find empty coordinates across Mon-Sat, periods 1-7
+        List<DayPeriodCoordinate> emptyCoords = new ArrayList<>();
+        for (DayOfWeek day : WORKING_DAYS) {
+            for (int p = MIN_PERIOD; p <= MAX_PERIOD; p++) {
+                if (!occupiedCoords.contains(day + ":" + p)) {
+                    emptyCoords.add(new DayPeriodCoordinate(day, p));
+                }
+            }
+        }
+
+        // Validate exactly 12 empty periods are available
+        if (emptyCoords.size() != 12) {
+            throw new ValidationException(
+                    "Section '" + section.getCode() + "' has " + emptyCoords.size() +
+                    " empty periods (expected 12 empty periods from 30 scheduled academic slots)."
+            );
+        }
+
+        // Snapshot original academic slot IDs to verify preservation
+        Set<Long> originalSlotIds = currentSlots.stream()
+                .map(TimetableSlot::getId)
+                .collect(Collectors.toSet());
+
+        // Ensure activity subjects exist
+        Map<String, Subject> activitySubjectMap = ensureActivitySubjectsExist(section.getDepartment(), section.getSemester());
+
+        // Create 12 activity slots deterministically
+        List<TimetableSlot> slotsToSave = new ArrayList<>();
+        for (int i = 0; i < emptyCoords.size(); i++) {
+            DayPeriodCoordinate coord = emptyCoords.get(i);
+            String activityCode = ACTIVITY_SCHEDULE.get(i);
+            Subject subject = activitySubjectMap.get(activityCode);
+
+            // Double check no conflict exists
+            if (slotRepository.existsBySectionIdAndDayAndPeriodIndex(section.getId(), coord.getDay(), coord.getPeriodIndex())) {
+                throw new SchedulingConflictException(
+                        "Section already has a slot on " + coord.getDay() + " period " + coord.getPeriodIndex() + "."
+                );
+            }
+
+            TimetableSlot activitySlot = new TimetableSlot(
+                    section,
+                    coord.getDay(),
+                    coord.getPeriodIndex(),
+                    1,     // spanPeriods = 1
+                    false, // isMultiPeriodHead = false
+                    false, // isMultiPeriodContinuation = false
+                    subject,
+                    null,  // faculty = null
+                    null   // room = null
+            );
+            slotsToSave.add(activitySlot);
+        }
+
+        slotRepository.saveAll(slotsToSave);
+
+        // Verification after save
+        List<TimetableSlot> allSectionSlots = slotRepository.findBySectionIdOrderByDayAscPeriodIndexAsc(sectionId);
+        if (allSectionSlots.size() != 42) {
+            throw new ValidationException("Expected 42 total slots after filling activities, but found " + allSectionSlots.size());
+        }
+
+        // Verify all original academic slot IDs are preserved
+        for (Long originalId : originalSlotIds) {
+            boolean exists = allSectionSlots.stream().anyMatch(s -> Objects.equals(s.getId(), originalId));
+            if (!exists) {
+                throw new ValidationException("Academic slot ID " + originalId + " was lost during activity fill.");
+            }
+        }
+
+        // Verify weekly activity frequencies
+        Map<String, Long> activityCounts = allSectionSlots.stream()
+                .filter(s -> s.getSubject() != null && institutionalCodes.contains(s.getSubject().getCode()))
+                .collect(Collectors.groupingBy(s -> s.getSubject().getCode(), Collectors.counting()));
+
+        for (ActivitySpec spec : INSTITUTIONAL_ACTIVITIES) {
+            long actual = activityCounts.getOrDefault(spec.getCode(), 0L);
+            if (actual != spec.getWeeklyPeriods()) {
+                throw new ValidationException(
+                        "Activity " + spec.getCode() + " expected frequency " + spec.getWeeklyPeriods() + " but got " + actual
+                );
+            }
+        }
+
+        // Verify null faculty and room on all institutional activity slots
+        for (TimetableSlot s : allSectionSlots) {
+            if (s.getSubject() != null && institutionalCodes.contains(s.getSubject().getCode())) {
+                if (s.getFaculty() != null || s.getRoom() != null) {
+                    throw new ValidationException("Activity slot has non-null faculty or room.");
+                }
+            }
+        }
+
+        return allSectionSlots.stream().map(this::mapToDTO).collect(Collectors.toList());
+    }
+
+    public Map<String, Subject> ensureActivitySubjectsExist(Department department, Semester semester) {
+        Map<String, Subject> map = new HashMap<>();
+        for (ActivitySpec spec : INSTITUTIONAL_ACTIVITIES) {
+            Subject subject = subjectRepository.findByCode(spec.getCode()).orElseGet(() -> {
+                Subject newSubj = new Subject(
+                        spec.getCode(),
+                        spec.getName(),
+                        spec.getShortName(),
+                        SubjectType.ACTIVITY,
+                        department,
+                        semester,
+                        null
+                );
+                return subjectRepository.save(newSubj);
+            });
+            map.put(spec.getCode(), subject);
+        }
+        return map;
+    }
+
     // -------------------------------------------------------------------------
     // Validation helpers
     // -------------------------------------------------------------------------
@@ -232,18 +452,9 @@ public class TimetableSlotService {
     }
 
     private void validateRoomSubjectTypeCompatibility(Room room, Subject subject) {
-        boolean subjectIsLab = (subject.getType() == SubjectType.LAB);
-        boolean roomIsLab    = (room.getType() == RoomType.LAB);
-
-        if (subjectIsLab && !roomIsLab) {
-            throw new SchedulingConflictException(
-                    "Subject '" + subject.getName() + "' is a LAB subject and requires a LAB room, " +
-                    "but room '" + room.getRoomNumber() + "' is of type " + room.getType() + ".");
-        }
-        if (!subjectIsLab && roomIsLab) {
-            throw new SchedulingConflictException(
-                    "Subject '" + subject.getName() + "' is not a LAB subject and cannot be assigned to " +
-                    "LAB room '" + room.getRoomNumber() + "'.");
+        String reason = RoomCompatibilityValidator.getIncompatibilityReason(room, subject);
+        if (reason != null) {
+            throw new SchedulingConflictException(reason);
         }
     }
 

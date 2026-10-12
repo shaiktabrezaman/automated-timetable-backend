@@ -155,7 +155,9 @@ public class SchedulerService {
         List<ScheduledAssignment> assignments = new ArrayList<>();
         BacktrackContext context = new BacktrackContext();
 
-        boolean solved = solve(0, sessions, occupiedClashKeys, assignments, section, offeringRoomsMap, context);
+        int targetDailyLoad = (int) Math.ceil((double) totalRequiredPeriods / WORKING_DAYS.size());
+
+        boolean solved = solve(0, sessions, occupiedClashKeys, assignments, section, offeringRoomsMap, context, targetDailyLoad);
         if (!solved) {
             SchedulingSession failed = context.deepestFailedSession != null ? context.deepestFailedSession : sessions.get(0);
             throw new SchedulingConflictException(
@@ -194,7 +196,8 @@ public class SchedulerService {
     }
 
     /**
-     * Recursive backtracking search to find a conflict-free schedule for all sessions.
+     * Recursive backtracking search to find a conflict-free schedule for all sessions,
+     * exploring candidate slots prioritized by quality preferences (subject spread and daily balance).
      */
     private boolean solve(int sessionIndex,
                           List<SchedulingSession> sessions,
@@ -202,7 +205,8 @@ public class SchedulerService {
                           List<ScheduledAssignment> assignments,
                           Section section,
                           Map<Long, List<Room>> offeringRoomsMap,
-                          BacktrackContext context) {
+                          BacktrackContext context,
+                          int targetDailyLoad) {
         if (sessionIndex >= sessions.size()) {
             return true; // All sessions successfully placed!
         }
@@ -219,41 +223,178 @@ public class SchedulerService {
         List<Integer> validStarts = getValidStartPeriods(duration);
         List<Room> candidateRooms = offeringRoomsMap.get(offering.getId());
 
-        // Deterministic iteration: Days Monday->Saturday, Start periods 1->7, Candidate rooms
-        for (DayOfWeek day : WORKING_DAYS) {
-            for (int startP : validStarts) {
-                // Quick check: does the section have any clash on these consecutive periods?
-                if (isSectionClashing(section.getId(), day, startP, duration, occupied)) {
+        // Prioritize candidate (day, startPeriod) slots:
+        // 1. Spread repeated sessions of the same offering across different days (soft preference).
+        // 2. Balance workload across Monday-Saturday towards targetDailyLoad (soft preference).
+        // 3. Fall back gracefully to less-preferred slots if clashes occur.
+        List<SlotCandidate> candidateSlots = getPrioritizedCandidateSlots(
+                session, assignments, validStarts, targetDailyLoad, section.getId(), faculty, occupied);
+
+        for (SlotCandidate slot : candidateSlots) {
+            DayOfWeek day = slot.day;
+            int startP = slot.startPeriod;
+
+            for (Room room : candidateRooms) {
+                if (isRoomClashing(room.getId(), day, startP, duration, occupied)) {
                     continue;
                 }
-                // Quick check: does faculty have any clash on these consecutive periods?
-                if (faculty != null && isFacultyClashing(faculty.getId(), day, startP, duration, occupied)) {
-                    continue;
+
+                // Place session
+                occupy(section.getId(), faculty, room.getId(), day, startP, duration, occupied);
+                ScheduledAssignment assignment = new ScheduledAssignment(session, day, startP, room);
+                assignments.add(assignment);
+
+                // Recurse to next session
+                if (solve(sessionIndex + 1, sessions, occupied, assignments, section, offeringRoomsMap, context, targetDailyLoad)) {
+                    return true;
                 }
 
-                for (Room room : candidateRooms) {
-                    if (isRoomClashing(room.getId(), day, startP, duration, occupied)) {
-                        continue;
-                    }
-
-                    // Place session
-                    occupy(section.getId(), faculty, room.getId(), day, startP, duration, occupied);
-                    ScheduledAssignment assignment = new ScheduledAssignment(session, day, startP, room);
-                    assignments.add(assignment);
-
-                    // Recurse to next session
-                    if (solve(sessionIndex + 1, sessions, occupied, assignments, section, offeringRoomsMap, context)) {
-                        return true;
-                    }
-
-                    // Backtrack / Undo placement
-                    assignments.remove(assignments.size() - 1);
-                    release(section.getId(), faculty, room.getId(), day, startP, duration, occupied);
-                }
+                // Backtrack / Undo placement
+                assignments.remove(assignments.size() - 1);
+                release(section.getId(), faculty, room.getId(), day, startP, duration, occupied);
             }
         }
 
         return false;
+    }
+
+    /**
+     * Builds and deterministically sorts candidate slot placements (day + startPeriod)
+     * using quality preferences while ensuring all valid combinations remain available for backtracking.
+     */
+    private List<SlotCandidate> getPrioritizedCandidateSlots(
+            SchedulingSession session,
+            List<ScheduledAssignment> assignments,
+            List<Integer> validStarts,
+            int targetDailyLoad,
+            Long sectionId,
+            Faculty faculty,
+            Set<String> occupied) {
+
+        Map<DayOfWeek, Integer> dayPeriodsMap = new EnumMap<>(DayOfWeek.class);
+        Map<DayOfWeek, Integer> dayMorningPeriodsMap = new EnumMap<>(DayOfWeek.class);
+        Map<DayOfWeek, Integer> dayAfternoonPeriodsMap = new EnumMap<>(DayOfWeek.class);
+        Map<DayOfWeek, Integer> offeringSessionsMap = new EnumMap<>(DayOfWeek.class);
+
+        for (DayOfWeek day : WORKING_DAYS) {
+            dayPeriodsMap.put(day, 0);
+            dayMorningPeriodsMap.put(day, 0);
+            dayAfternoonPeriodsMap.put(day, 0);
+            offeringSessionsMap.put(day, 0);
+        }
+
+        int morningBlocks = 0;
+        int afternoonBlocks = 0;
+
+        for (ScheduledAssignment a : assignments) {
+            int dur = a.session.durationPeriods;
+            dayPeriodsMap.put(a.day, dayPeriodsMap.get(a.day) + dur);
+
+            if (a.startPeriod <= LAST_MORNING_PERIOD) {
+                dayMorningPeriodsMap.put(a.day, dayMorningPeriodsMap.get(a.day) + dur);
+                if (dur >= 2) {
+                    morningBlocks++;
+                }
+            } else {
+                dayAfternoonPeriodsMap.put(a.day, dayAfternoonPeriodsMap.get(a.day) + dur);
+                if (dur >= 2) {
+                    afternoonBlocks++;
+                }
+            }
+
+            boolean isSameOffering = (session.offering.getId() != null && a.session.offering.getId() != null)
+                    ? session.offering.getId().equals(a.session.offering.getId())
+                    : (a.session.offering == session.offering
+                    || Objects.equals(a.session.offering.getSubject().getCode(), session.offering.getSubject().getCode()));
+            if (isSameOffering) {
+                offeringSessionsMap.put(a.day, offeringSessionsMap.get(a.day) + 1);
+            }
+        }
+
+        final int mBlocks = morningBlocks;
+        final int aBlocks = afternoonBlocks;
+        int duration = session.durationPeriods;
+        List<SlotCandidate> candidates = new ArrayList<>();
+
+        for (DayOfWeek day : WORKING_DAYS) {
+            for (int startP : validStarts) {
+                // Quick filter: skip slots where the section or faculty already has a hard conflict
+                if (isSectionClashing(sectionId, day, startP, duration, occupied)) {
+                    continue;
+                }
+                if (faculty != null && isFacultyClashing(faculty.getId(), day, startP, duration, occupied)) {
+                    continue;
+                }
+                candidates.add(new SlotCandidate(day, startP));
+            }
+        }
+
+        candidates.sort((c1, c2) -> {
+            // 1. Offering spread preference: prefer days where this offering has fewer sessions today
+            int offCount1 = offeringSessionsMap.get(c1.day);
+            int offCount2 = offeringSessionsMap.get(c2.day);
+            if (offCount1 != offCount2) {
+                return Integer.compare(offCount1, offCount2);
+            }
+
+            // 2. Workload balance preference: prefer slots that do not exceed targetDailyLoad
+            int load1 = dayPeriodsMap.get(c1.day);
+            int load2 = dayPeriodsMap.get(c2.day);
+            boolean exceeds1 = (load1 + duration > targetDailyLoad);
+            boolean exceeds2 = (load2 + duration > targetDailyLoad);
+            if (exceeds1 != exceeds2) {
+                return Boolean.compare(exceeds1, exceeds2); // false (within budget) comes before true
+            }
+
+            // 3. Workload balance preference: prefer days with lower current workload
+            if (load1 != load2) {
+                return Integer.compare(load1, load2);
+            }
+
+            // 4. Deterministic day ordering (Monday -> Saturday)
+            if (c1.day != c2.day) {
+                return c1.day.compareTo(c2.day);
+            }
+
+            // 5. Intra-day session balancing:
+            // For multi-period blocks (labs/activities): balance between morning (P1-P3) and afternoon (P5-P7) blocks.
+            // For theory: balance morning vs afternoon sessions on that day so later periods (P6/P7) are naturally utilized.
+            if (duration >= 2) {
+                boolean isAft1 = (c1.startPeriod >= FIRST_AFTERNOON_PERIOD);
+                boolean isAft2 = (c2.startPeriod >= FIRST_AFTERNOON_PERIOD);
+                boolean preferAfternoonBlock = (mBlocks > aBlocks);
+                boolean match1 = (isAft1 == preferAfternoonBlock);
+                boolean match2 = (isAft2 == preferAfternoonBlock);
+                if (match1 != match2) {
+                    return Boolean.compare(!match1, !match2); // true (preferred session) comes before false
+                }
+            } else {
+                int targetM = (int) Math.round(targetDailyLoad * (double) LAST_MORNING_PERIOD / MAX_PERIOD);
+                int targetA = Math.max(1, targetDailyLoad - targetM);
+
+                boolean isAft1 = (c1.startPeriod >= FIRST_AFTERNOON_PERIOD);
+                boolean isAft2 = (c2.startPeriod >= FIRST_AFTERNOON_PERIOD);
+
+                int mLoad = dayMorningPeriodsMap.get(c1.day);
+                int aLoad = dayAfternoonPeriodsMap.get(c1.day);
+
+                boolean sessExceeds1 = isAft1
+                        ? (aLoad + duration > targetA && mLoad < targetM)
+                        : (mLoad + duration > targetM && aLoad < targetA);
+                boolean sessExceeds2 = isAft2
+                        ? (aLoad + duration > targetA && mLoad < targetM)
+                        : (mLoad + duration > targetM && aLoad < targetA);
+
+                if (sessExceeds1 != sessExceeds2) {
+                    return Boolean.compare(sessExceeds1, sessExceeds2); // within session budget comes first
+                }
+            }
+
+            // 6. Within the preferred session, deterministic period index ordering
+            return Integer.compare(c1.startPeriod, c2.startPeriod);
+        });
+
+        return candidates;
     }
 
     /**
@@ -262,13 +403,12 @@ public class SchedulerService {
      */
     private List<Room> determineCandidateRooms(CourseOffering offering, Section section, List<Room> allRooms) {
         Subject subject = offering.getSubject();
-        boolean isLab = (subject.getType() == SubjectType.LAB);
         int requiredCapacity = section.getStudentCount();
 
-        // Filter by capacity and LAB/non-LAB compatibility
+        // Filter by capacity and room compatibility (type, exclusivity, seminar hall)
         List<Room> validRooms = allRooms.stream()
                 .filter(r -> r.getCapacity() >= requiredCapacity)
-                .filter(r -> isLab ? (r.getType() == RoomType.LAB) : (r.getType() != RoomType.LAB))
+                .filter(r -> RoomCompatibilityValidator.isCompatible(r, subject))
                 .sorted(Comparator.comparing(Room::getRoomNumber, String.CASE_INSENSITIVE_ORDER))
                 .collect(Collectors.toList());
 
@@ -280,14 +420,14 @@ public class SchedulerService {
             orderedRooms.add(preferred);
         }
 
-        // 2. Section defaultRoom has second priority (for non-lab subjects)
+        // 2. Section defaultRoom has second priority (for classroom/theory subjects)
         Room defaultRoom = section.getDefaultRoom();
-        if (defaultRoom != null && !isLab && validRooms.contains(defaultRoom) && !orderedRooms.contains(defaultRoom)) {
+        if (defaultRoom != null && validRooms.contains(defaultRoom) && !orderedRooms.contains(defaultRoom)) {
             orderedRooms.add(defaultRoom);
         }
 
-        // 3. Prefer standard CLASSROOM over SEMINAR_HALL for non-lab subjects
-        if (!isLab) {
+        // 3. For theory subjects, prefer standard CLASSROOM over others
+        if (subject.getType() == SubjectType.THEORY || subject.getType() == SubjectType.ELECTIVE) {
             for (Room r : validRooms) {
                 if (r.getType() == RoomType.CLASSROOM && !orderedRooms.contains(r)) {
                     orderedRooms.add(r);
@@ -397,6 +537,16 @@ public class SchedulerService {
             this.day = day;
             this.startPeriod = startPeriod;
             this.room = room;
+        }
+    }
+
+    private static class SlotCandidate {
+        final DayOfWeek day;
+        final int startPeriod;
+
+        SlotCandidate(DayOfWeek day, int startPeriod) {
+            this.day = day;
+            this.startPeriod = startPeriod;
         }
     }
 
